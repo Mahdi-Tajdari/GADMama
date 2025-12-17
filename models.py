@@ -136,7 +136,7 @@ class GCN_mamba_Net(torch.nn.Module):
         all_layers_output = F.dropout(all_layers_output, p=self.dropout, training=self.training)
         y = self.lin2(output)
 
-        return all_layers_output, F.log_softmax(y, dim=-1)
+        return output, F.log_softmax(y, dim=-1)
 
 
 class GCN_mamba_block(torch.nn.Module):
