@@ -11,57 +11,77 @@ import torch_geometric.transforms as T
 from torch_geometric.datasets import Planetoid, Reddit # etc.
 
 # In your dataset_loader.py file
+import torch
+import os.path as osp
+import numpy as np
+import scipy.sparse as sp
+import scipy.io
+from torch_geometric.data import Data
+from torch_geometric.utils import from_scipy_sparse_matrix
 
 def load_anomaly_mat_dataset(name, root='data/'):
     """
-    Loads and preprocesses graph anomaly detection datasets from .mat files.
+    دیتاست‌های تشخیص ناهنجاری را از فایل‌های .mat بارگذاری و پیش‌پردازش می‌کند.
     
-    IMPORTANT: This version REMOVES the feature normalization, allowing the model's
-    initial nn.Linear layer to act as a proper embedding layer on the raw features,
-    which prevents over-smoothing.
+    نکته بسیار مهم: این نسخه شامل نرمال‌سازی سطری (row-normalization) برای ویژگی‌هاست
+    که یک مرحله حیاتی برای جلوگیری از فروپاشی مدل (model collapse) و صفر شدن گرادیان‌هاست.
     """
     filepath = osp.join(root, f'{name}.mat')
     if not osp.exists(filepath):
-        raise FileNotFoundError(f"Dataset .mat file not found at: {filepath}")
+        raise FileNotFoundError(f"فایل .mat دیتاست در این مسیر پیدا نشد: {filepath}")
 
-    print(f"Loading '{name}' from {filepath}. SKIPPING feature pre-processing to use model's embedding layer.")
+    print(f"در حال بارگذاری '{name}' از {filepath} همراه با نرمال‌سازی ویژگی‌ها.")
     mat_data = scipy.io.loadmat(filepath)
 
-    # 1. Load data
+    # ۱. بارگذاری داده‌های خام از فایل
     adj = mat_data.get('Network', mat_data.get('A'))
     features = mat_data.get('Attributes', mat_data.get('X'))
     labels = mat_data.get('Label', mat_data.get('gnd'))
 
-    # Convert to sparse formats
+    # تبدیل به فرمت‌های اسپارس برای کارایی بهتر
     adj = sp.csr_matrix(adj)
     features = sp.lil_matrix(features)
 
-    # ------------------- THE CRUCIAL CHANGE IS HERE -------------------
+    # ------------------- تغییر اصلی و حیاتی اینجاست -------------------
     #
-    # 2. Convert raw features directly to a dense tensor.
-    # We NO LONGER perform row-normalization here. The model's first linear
-    # layer (`lin1`) will handle this transformation much more effectively.
+    # ۲. پیش‌پردازش و نرمال‌سازی ویژگی‌ها (Row-Normalization)
+    # این کار باعث می‌شود که ویژگی‌های هر نود مقیاس مشابهی داشته باشند و مدل
+    # به جای پیدا کردن راه‌حل ساده (خروجی صفر)، مجبور به یادگیری ساختار داده شود.
     #
+    print("در حال اعمال نرمال‌سازی سطری روی ویژگی‌ها. این مرحله بسیار مهم است.")
     if sp.issparse(features):
+        # محاسبه معکوس مجموع هر سطر
+        row_sum = np.array(features.sum(axis=1), dtype=np.float32).flatten()
+        r_inv = np.power(row_sum, -1)
+        r_inv[np.isinf(r_inv)] = 0. # مقادیر بی‌نهایت (ناشی از تقسیم بر صفر) را صفر می‌کنیم
+        r_mat_inv = sp.diags(r_inv) # ساخت ماتریس قطری از مقادیر معکوس
+        
+        # ضرب ماتریس قطری در ماتریس ویژگی‌ها برای نرمال‌سازی
+        features = r_mat_inv.dot(features)
         features_tensor = torch.FloatTensor(features.toarray())
-    else:
+    else: # اگر ویژگی‌ها اسپارس نباشند (که در این دیتاست‌ها هستند)
+        row_sum = features.sum(axis=1, keepdims=True)
+        row_sum[row_sum == 0] = 1 # جلوگیری از تقسیم بر صفر
+        features = features / row_sum
         features_tensor = torch.FloatTensor(features)
     #
     # ------------------------------------------------------------------
 
-    # 3. Preprocess Adjacency Matrix (Symmetric Normalization - this is still correct)
+    # ۳. پیش‌پردازش ماتریس مجاورت (Symmetric Normalization - بدون تغییر)
     adj_normalized = adj + sp.eye(adj.shape[0])
     row_sum = np.array(adj_normalized.sum(axis=1)).flatten()
     d_inv_sqrt = np.power(row_sum, -0.5).flatten()
     d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     adj_normalized = adj_normalized.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
+    
+    # تبدیل به فرمت مورد نیاز PyG
     edge_index, edge_weight = from_scipy_sparse_matrix(adj_normalized)
 
-    # 4. Convert labels to tensor
+    # ۴. تبدیل لیبل‌ها به تنسور
     labels_tensor = torch.LongTensor(labels).squeeze()
 
-    # 5. Create PyG Data object
+    # ۵. ساخت آبجکت نهایی PyTorch Geometric Data
     pyg_data = Data(x=features_tensor, edge_index=edge_index, edge_attr=edge_weight, y=labels_tensor)
     pyg_data.num_nodes = features_tensor.shape[0]
 
