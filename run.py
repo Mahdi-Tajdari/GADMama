@@ -1,4 +1,5 @@
-# run.py (fixed to return per-node cost for scoring)
+
+# run.py
 
 import torch
 import torch.nn as nn
@@ -10,32 +11,17 @@ from model import Dominant
 from utils import load_anomaly_detection_dataset
 import torch.nn.functional as F
 
-def loss_func(adj, A_hat, attrs, X_hat, neigh_recon, neigh_attrs, alpha, beta=0.1, gamma=0.0):
-    # Original attribute reconstruction
+def loss_func(adj, A_hat, attrs, X_hat, alpha):
     diff_attribute = F.binary_cross_entropy_with_logits(X_hat, attrs, reduction='none')
-    attribute_reconstruction_errors = torch.sum(diff_attribute, 1)  # Per-node
+    attribute_reconstruction_errors = torch.sum(diff_attribute, 1)
     attribute_cost = torch.mean(attribute_reconstruction_errors)
 
-    # Structure reconstruction
     diff_structure = torch.pow(A_hat - adj, 2)
-    structure_reconstruction_errors = torch.sqrt(torch.sum(diff_structure, 1))  # Per-node
+    structure_reconstruction_errors = torch.sqrt(torch.sum(diff_structure, 1))
     structure_cost = torch.mean(structure_reconstruction_errors)
 
-    # Neighborhood loss (per-node)
-    diff_neigh = F.binary_cross_entropy_with_logits(neigh_recon, neigh_attrs, reduction='none')
-    neigh_errors = torch.mean(diff_neigh, dim=[1, 2])  # Mean over neighbors and features, per-node
-    neigh_loss = torch.mean(neigh_errors)
-
-    # Placeholder for contrastive loss (scalar)
-    contrastive_loss = torch.tensor(0.0, device=adj.device)
-
-    # Per-node cost
-    cost = alpha * attribute_reconstruction_errors + (1 - alpha) * structure_reconstruction_errors + beta * neigh_errors + gamma * contrastive_loss
-
-    # Mean for total loss
-    total_cost = torch.mean(cost)
-
-    return cost, structure_cost, attribute_cost, neigh_loss  # Return per-node cost first
+    cost = alpha * attribute_reconstruction_errors + (1 - alpha) * structure_reconstruction_errors
+    return cost, structure_cost, attribute_cost
 
 def train_dominant(args):
     adj, attrs, label, adj_label = load_anomaly_detection_dataset(args.dataset)
@@ -76,26 +62,26 @@ def train_dominant(args):
         model.train()
         optimizer.zero_grad()
         
-        # Forward
-        A_hat, X_hat, neigh_recon, neigh_attrs = model(attrs_tensor, adj_tensor, labels=numpy_labels, epoch=epoch)
+        # <<< MODIFIED: Pass labels and epoch for analysis >>>
+        A_hat, X_hat = model(attrs_tensor, adj_tensor, labels=numpy_labels, epoch=epoch)
         
-        # Loss with alpha=0.4
-        cost, struct_loss, feat_loss, neigh_loss = loss_func(adj_label_tensor, A_hat, attrs_tensor, X_hat, neigh_recon, neigh_attrs, alpha=0.4)
+        loss, struct_loss, feat_loss = loss_func(adj_label_tensor, A_hat, attrs_tensor, X_hat, args.alpha)
         
-        loss = torch.mean(cost)  # Total loss for backward
-        loss.backward()
+        l = torch.mean(loss)
+        l.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()        
         
         if epoch % 10 == 0:
-            print(f"Epoch: {epoch:04d}, train_loss={loss.item():.5f}, "
-                  f"struct_loss={struct_loss.item():.5f}, feat_loss={feat_loss.item():.5f}, neigh_loss={neigh_loss.item():.5f}")
+            print(f"Epoch: {epoch:04d}, train_loss={l.item():.5f}, "
+                  f"struct_loss={struct_loss.item():.5f}, feat_loss={feat_loss.item():.5f}")
 
             model.eval()
             with torch.no_grad():
-                A_hat, X_hat, neigh_recon, neigh_attrs = model(attrs_tensor, adj_tensor)
-                val_cost, _, _, _ = loss_func(adj_label_tensor, A_hat, attrs_tensor, X_hat, neigh_recon, neigh_attrs, alpha=0.4)
-                score = val_cost.cpu().numpy()  # Per-node scores
+                # For eval, we don't pass labels
+                A_hat, X_hat = model(attrs_tensor, adj_tensor)
+                val_loss, _, _ = loss_func(adj_label_tensor, A_hat, attrs_tensor, X_hat, args.alpha)
+                score = val_loss.cpu().numpy()
                 try:
                     auc = roc_auc_score(label, score)
                     print(f"Epoch: {epoch:04d}, AUC: {auc:.4f}")
@@ -109,7 +95,7 @@ if __name__ == '__main__':
     parser.add_argument('--epoch', type=int, default=300, help='Training epochs')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout for decoders')
-    parser.add_argument('--alpha', type=float, default=0.4, help='Balance parameter for losses')  # Updated default to 0.4
+    parser.add_argument('--alpha', type=float, default=0.8, help='Balance parameter for losses')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='AdamW weight decay')
     parser.add_argument('--device', default='cuda', type=str, help='cuda/cpu')
     parser.add_argument('--d_model', type=int, default=64, help='Mamba model dimension (hidden size)')
@@ -120,8 +106,10 @@ if __name__ == '__main__':
     parser.add_argument('--mamba_dropout', type=float, default=0.2, help='Dropout inside Mamba blocks')
     parser.add_argument('--bias', action='store_true', help='Use bias in linear layers')
     parser.add_argument('--encoder_mode', type=str, default='local', 
-                        choices=['linear', 'local', 'global'], 
+                        # 'gcn_only' را اینجا اضافه کنید
+                        choices=['linear', 'local', 'global', 'gcn_only'], 
                         help='Type of encoder architecture to use.')
+
     args = parser.parse_args()
     print(args)
     train_dominant(args)
